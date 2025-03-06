@@ -1,9 +1,12 @@
+import sys
+import math
 import numpy as np
 import pandas as pd
 from difflib import *
 import os
 from pandas import DatetimeIndex
 import re
+import openpyxl
 
 no_match_flag = "NO_MATCH_FOUND"
 main_df_filepath = (r'O:\DATA4\Projects\223002\DESIGN\ANALYSIS\2023.05.18 SCOPE '
@@ -72,22 +75,6 @@ def get_other_replacements(other_dataframe):
         other_dict[other] = replacement
     return other_dict
 
-def populate_gwp_sources(main_dataframe):
-    # populate the GWP Source column
-    main_dataframe["GWP Source"] = [np.nan] * len(main_dataframe)
-
-    # mark EPDs that come from industry avgs vs actual vals
-    industry_avgs_df = pd.read_excel(industry_averages_file)
-    actual_gwp_df = pd.read_excel(actual_gwp_file)
-
-    # if unique name is in industry average
-    main_dataframe["GWP Source"] = np.where(main_dataframe['UniqueName'].isin(industry_avgs_df['UniqueName']), "Industry Average/Reference", main_dataframe["GWP Source"])
-
-    # if unique name is in actual
-    main_dataframe["GWP Source"] = np.where(main_dataframe['UniqueName'].isin(actual_gwp_df['UniqueName']), "Actual",
-                                            main_dataframe["GWP Source"])
-
-    return main_dataframe
 
 def fix_missing_gwp(main_dataframe, replacement_dictionary):
     """takes in main dataframe and replaces missing gwp value based on gwp dict"""
@@ -97,12 +84,13 @@ def fix_missing_gwp(main_dataframe, replacement_dictionary):
             other_keys = replacement_dictionary['Others'].keys()
             for other_key in other_keys:
                 # first replace the source type
+                """
                 main_dataframe['GWP Source'] = np.where(
                     ((main_dataframe['Material Group'] == material) & (
                         main_dataframe['UniqueName'].str.contains(other_key)) &
                      main_dataframe['Adjusted GWP (per Ozinga UOM)'].isnull()),
                     "Database Average",
-                    main_dataframe['GWP Source'])
+                    main_dataframe['GWP Source'])"""
 
                 # then replace the gwp
                 main_dataframe['Adjusted GWP (per Ozinga UOM)'] = np.where(
@@ -114,10 +102,12 @@ def fix_missing_gwp(main_dataframe, replacement_dictionary):
         else:
             if not pd.isnull(material):
                 # first replace the source type
+                """
                 main_dataframe["GWP Source"] = np.where(
                     ((main_dataframe['Material Group'] == material) & main_dataframe[
                         'Adjusted GWP (per Ozinga UOM)'].isnull()),
                     "Database Average", main_dataframe["GWP Source"])
+                    """
 
                 # then replace the gwp
                 main_dataframe['Adjusted GWP (per Ozinga UOM)'] = np.where(
@@ -152,23 +142,69 @@ def populate_facility_and_location(export_dataframe, inbound_inventory_dataframe
     return export_dataframe
 
 
+def check_date(inbound_row, product_matches):
+    """
+    :param inbound_row: row to check date for
+    :param product_matches: rows that matched the inbound row
+    :return: adjusted gwp of closest date, whether gwp is expired or not
+    """
+    date = inbound_row['ticket_date']
+
+    expired = False
+    diff = sys.maxsize
+    adjusted_gwp = np.nan
+
+    for index, row in product_matches.iterrows():
+        effective_from_date = row['Effective From']
+        effective_to_date = row['Effective To']
+
+        if effective_from_date.day is np.nan or effective_to_date is np.nan:
+            expired = np.nan
+            adjusted_gwp = row['Adjusted GWP (per Ozinga UOM)']
+            continue
+
+        # if date is past the effective to date, set expired to be true
+        if date > effective_to_date:
+            expired = True
+        else:
+            expired = False
+
+        # look for date closest to date of inbound inventory row
+        curr_diff = date - effective_to_date
+        day_diff = abs(curr_diff.days)
+        if day_diff < diff:
+            # if date is closest to date, adjust gwp
+            diff = day_diff
+            adjusted_gwp = row['Adjusted GWP (per Ozinga UOM)']
+
+        if effective_from_date <= date <= effective_to_date:
+            adjusted_gwp = row['Adjusted GWP (per Ozinga UOM)']
+            break
+    return adjusted_gwp, expired
+
+
 def populate_gwp_and_material(main_replaced_dataframe, export_dataframe, unique_name_to_mat_dict,
                               close_match_dictionary,
-                              inbound_unique_names,
+                              inbound_unique_names, inbound_inventory_dataframe,
                               gwp_replace_dict):
     """ takes in main database, database to be exported, and unique name dictionary. Iterates over each unique name
     in inbound inventory and finds the corresponding gwp and material from the gwp database. If no match can be
-    found, it will try to find the closest match. returns dataframe to be exported with populated gwp and material columns"""
+    found, it will try to find the closest match. returns dataframe to be exported with populated gwp and material
+    columns"""
     new_material_col = []
     new_adjusted_gwp_col = []
+    expired_col = []
 
-    for name in inbound_unique_names:
+    for index, row in inbound_inventory_dataframe.iterrows():
+
+        name = row['unique_name']
 
         # look for close match
         close_match = close_match_dictionary[name]
 
         material_name = no_match_flag
         adjusted_gwp = np.nan
+        expired = np.nan
 
         # if close match to name, add material group and average adjusted gwp of that material
         if not pd.isnull(close_match):
@@ -177,8 +213,9 @@ def populate_gwp_and_material(main_replaced_dataframe, export_dataframe, unique_
 
             # if name is an exact match, replace with exact same GWP
             if name == close_match:
-                adjusted_gwp = round(main_replaced_dataframe[main_replaced_dataframe['UniqueName'] == close_match][
-                                         'Adjusted GWP (per Ozinga UOM)'].item(), 2)
+                adjusted_gwp_matches = main_replaced_dataframe[main_replaced_dataframe['UniqueName'] == close_match]
+                adjusted_gwp, expired = check_date(row, adjusted_gwp_matches)
+
             # if match is not exact match, replace with average GWP for given material
             else:
                 # if Others have to navigate nested dictionary
@@ -194,11 +231,16 @@ def populate_gwp_and_material(main_replaced_dataframe, export_dataframe, unique_
         # add adjusted gwp to new column
         new_adjusted_gwp_col.append(adjusted_gwp)
 
+        expired_col.append(expired)
+
     # populate material column
     export_dataframe['Material Group'] = new_material_col
 
     # populate adjusted gwp
     export_dataframe['Adjusted GWP (per Ozinga UOM)'] = new_adjusted_gwp_col
+
+    # add temporary expiration column
+    export_dataframe['Expired'] = expired_col
 
     return export_dataframe
 
@@ -272,6 +314,11 @@ def populate_distances(inbound_inventory_dataframe, distance_dataframe, export_d
     rail_dists = []
     ocean_dists = []
     barge_dists = []
+    not_in_dist_db = inbound_inventory_dataframe.copy()
+
+    # preprocess distance database
+    processed_supplier_to_delivery_warehouse = [s.replace(" ", "").replace("\n", "").replace("_x000D_", "").lower() for s in distance_dataframe['supplier_to_delivery_warehouse']]
+    distance_dataframe['processed_supplier_to_delivery_warehouse'] = processed_supplier_to_delivery_warehouse
 
     # populate distances from distance dataframe
     for index, row in inbound_inventory_dataframe.iterrows():
@@ -283,16 +330,18 @@ def populate_distances(inbound_inventory_dataframe, distance_dataframe, export_d
         delivery_warehouse = inbound_inventory_dataframe['delivery_warehouse'][index]
         address = inbound_inventory_dataframe['material_site_address'][index]
         if (not pd.isnull(address)) and (not pd.isnull(delivery_warehouse)):
-
-            supplier_to_delivery_warehouse = address + "_" + delivery_warehouse.split()[0]
+            delivery_warehouse = delivery_warehouse.split()[0].replace(" ", "").replace("\n", "")
+            address = address.replace(" ", "").replace("\n", "")
+            supplier_to_delivery_warehouse = address.lower() + "_" + delivery_warehouse.lower()
             matching_row = distance_dataframe[
-                distance_dataframe['supplier_to_delivery_warehouse'] == supplier_to_delivery_warehouse]
+                distance_dataframe['processed_supplier_to_delivery_warehouse'] == supplier_to_delivery_warehouse]
 
             if not matching_row.empty:
                 truck_dist = matching_row['Truck (miles)'].iloc[0]
                 rail_dist = matching_row['Rail (miles)'].iloc[0]
                 ocean_dist = matching_row['Ocean (miles)'].iloc[0]
                 barge_dist = matching_row['Barge (miles)'].iloc[0]
+                not_in_dist_db.drop(index=index, axis=0, inplace=True)
 
         truck_dists.append(truck_dist)
         rail_dists.append(rail_dist)
@@ -304,7 +353,7 @@ def populate_distances(inbound_inventory_dataframe, distance_dataframe, export_d
     export_dataframe['Ocean (miles)'] = ocean_dists
     export_dataframe['Barge (miles)'] = barge_dists
 
-    return export_dataframe
+    return export_dataframe, not_in_dist_db
 
 
 def find_most_recent_file(inbound_inventory_folder_path, inbound_start, inbound_end):
@@ -328,29 +377,12 @@ def find_most_recent_file(inbound_inventory_folder_path, inbound_start, inbound_
     return inbound_inventory_filepath
 
 
-def generate_report(main_database, export_database, inbound_database):
+def generate_report(main_database, export_database, inbound_database, report_dataframes):
     """takes in main dataframe, dataframe to export, and the inbound inventory dataframe. Uses these dataframes to
     generate a report of matching percentages and important missing values"""
-    report_dataframes = {}
 
     # check for names in inbound inventory that don't exist in main database
     unique_name_not_found = export_database[~export_database['unique_name'].isin(main_database['UniqueName'])]
-
-    # check for warehouses not in distances dataframe
-    nan_distances = export_database[(
-            export_database['Truck (miles)'].isna() & export_database['Train (miles)'].isna() & export_database[
-        'Train (miles)'].isna() &
-            export_database['Ocean (miles)'].isna() & export_database['Barge (miles)'].isna())]
-    nan_dist_warehouse = inbound_database[inbound_database['unique_name'].isin(nan_distances['unique_name'])][
-        'delivery_warehouse']
-    nan_dist_mat_address = inbound_database[inbound_database['unique_name'].isin(nan_distances['unique_name'])][
-        'material_site_address']
-    nan_dist_del_address = inbound_database[inbound_database['unique_name'].isin(nan_distances['unique_name'])][
-
-        'delivery_warehouse_address']
-    nan_distances.insert(1, 'material_site_address', nan_dist_mat_address)
-    nan_distances.insert(2, 'delivery_warehouse', nan_dist_warehouse)
-    nan_distances.insert(3, 'delivery_warehouse_address', nan_dist_del_address)
 
     # check for names in inbound inventory that don't have adjusted gwp filled
     nan_gwp = export_database[export_database['Adjusted GWP (per Ozinga UOM)'].isna()]
@@ -361,34 +393,18 @@ def generate_report(main_database, export_database, inbound_database):
         'delivery_warehouse']
     nan_loc_id.insert(1, 'delivery_warehouse', nan_loc_warehouses)
 
-    # check for materials that use ocean emissions
-    ocean_emissions = export_database[export_database['Ocean (miles)'] != 0]
-    ocean_emissions = ocean_emissions[~ocean_emissions['Ocean (miles)'].isna()]
+    # check for expired
+    expired_gwp = export_database[export_database['Expired'] == True]
 
-    industry_avgs_df = pd.read_excel(industry_averages_file)
-    actual_gwp_df = pd.read_excel(actual_gwp_file)
-
-    # check for source %
-    actual_sources = export_database[export_database['unique_name'].isin(actual_gwp_df['UniqueName'])]
-    industry_sources = export_database[export_database['unique_name'].isin(industry_avgs_df['UniqueName'])]
-    database_sources = export_database[
-        ~export_database['unique_name'].isin(actual_gwp_df['UniqueName']) &  # Not in exclude_column_1
-        ~export_database['unique_name'].isin(industry_avgs_df['UniqueName']) # Not in exclude_column_2
-        ]
-    database_sources = database_sources[database_sources['Adjusted GWP (per Ozinga UOM)'] != 0]
-    database_sources = database_sources[~database_sources['Adjusted GWP (per Ozinga UOM)'].isna()]
-
+    nan_distances = report_dataframes["Locations not in Distance DB"]
+    nan_distances = nan_distances[['unique_name','material_site_address', 'delivery_warehouse', 'delivery_warehouse_address']]
 
     # remove unique name duplicates from dataframes
     unique_name_not_found = unique_name_not_found.drop_duplicates(subset=['unique_name'])
     nan_distances = nan_distances.drop_duplicates(subset=['unique_name'])
     nan_loc_id = nan_loc_id.drop_duplicates(subset=['unique_name'])
     nan_gwp = nan_gwp.drop_duplicates(subset=['unique_name'])
-    '''
-    ocean_emissions = ocean_emissions.drop_duplicates(subset=['unique_name'])
-    actual_sources = actual_sources.drop_duplicates(subset=['unique_name'])
-    industry_sources = industry_sources.drop_duplicates(subset=['unique_name'])
-    database_sources = database_sources.drop_duplicates(subset=['unique_name']) '''
+    expired_gwp = expired_gwp.drop_duplicates(subset=['unique_name'])
 
     # calculate match percentages
     match_percentages = {}
@@ -400,20 +416,14 @@ def generate_report(main_database, export_database, inbound_database):
     nan_truck = export_database[export_database['Truck (miles)'].isna()]
     truck_match_percentage = round(((len(export_database) - len(nan_truck)) / len(export_database)) * 100, 2)
     location_percentage = round(((len(export_database) - len(nan_loc_id)) / len(export_database)) * 100, 2)
-    ocean_em_percentage = round((len(ocean_emissions) / len(export_database)) * 100, 2)
-    actual_percentage = round((len(actual_sources)/len(export_database))* 100, 2)
-    industry_percentage = round((len(industry_sources)/len(export_database))* 100, 2)
-    database_percentage = round((len(database_sources)/len(export_database))* 100, 2)
+    expired_gwp_percentage = round(((len(expired_gwp)) / len(export_database)) * 100, 2)
 
     # add match percentages to dictionary
     match_percentages["% GWPs Filled In"] = str(gwp_match_percentage) + "%"
     match_percentages["Matching Material Names in GWP DB"] = str(unique_name_percentage) + "%"
     match_percentages["Matching Truck Distances"] = str(truck_match_percentage) + "%"
     match_percentages["Matching Locations"] = str(location_percentage) + "%"
-    match_percentages["Percentage of Ocean Emissions"] = str(ocean_em_percentage) + "%"
-    match_percentages["Actual Sources"] = str(actual_percentage) + "%"
-    match_percentages["Industry/Reference Sources"] = str(industry_percentage) + "%"
-    match_percentages["Database Averages"] = str(database_percentage) + "%"
+    match_percentages["Expired GWPs"] = str(expired_gwp_percentage) + "%"
     percentage_dataframe = pd.DataFrame(data=match_percentages, index=[0])
 
     # add created dataframes to the list of dataframes to be returned
@@ -422,8 +432,7 @@ def generate_report(main_database, export_database, inbound_database):
     report_dataframes["Locations not in Distance DB"] = nan_distances
     report_dataframes["Materials Missing GWP Factor"] = nan_gwp
     report_dataframes["Locations not in FacilityList"] = nan_loc_id
-    report_dataframes["Materials with Ocean Emissions"] = ocean_emissions
-
+    report_dataframes["Expired GWPs"] = expired_gwp
     return report_dataframes
 
 
@@ -452,25 +461,29 @@ def process_inbound_inventory(main_dataframe, facility_dataframe, distance_dataf
                                                                                  unique_name_dictionary)
     export_df['unique_name'] = unique_names_col
 
-    # populate gwp sources
-    main_replaced_df = populate_gwp_sources(main_dataframe)
+    report_dataframes = {}
 
     # replace missing GWP values in main dataframe
-    main_replaced_df = fix_missing_gwp(main_replaced_df, replacement_dict)
+    main_replaced_df = fix_missing_gwp(main_dataframe, replacement_dict)
 
     # populate dataframe to export
     export_df = populate_gwp_and_material(main_replaced_df, export_df, unique_name_dictionary, close_match_dict,
-                                          unique_names_col, replacement_dict)
+                                          unique_names_col, inbound_inventory, replacement_dict)
     export_df = populate_facility_and_location(export_df, inbound_inventory, facility_dataframe)
-    export_df = populate_distances(inbound_inventory, distance_dataframe, export_df)
+    export_df, nan_distances = populate_distances(inbound_inventory, distance_dataframe, export_df)
+    report_dataframes["Match Percentages"] = []
+    report_dataframes["Locations not in Distance DB"] = nan_distances
 
     # remove rows where no match was found
     export_df.dropna(subset=['Material Group'], inplace=True)
     export_df = export_df[~export_df['Material Group'].str.contains(no_match_flag)]
 
-    export_df['GWP Source'] = main_replaced_df['GWP Source']
+    #export_df['GWP Source'] = main_replaced_df['GWP Source']
     # generate report of nan / missing values
-    report_data = generate_report(main_dataframe, export_df, inbound_inventory)
+    report_data = generate_report(main_dataframe, export_df, inbound_inventory, report_dataframes)
+
+    # drop the expiration column
+    export_df.drop(columns='Expired', inplace=True)
 
     # fill na values in export dataframe
     export_df.fillna(0, inplace=True)
